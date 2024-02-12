@@ -8,7 +8,7 @@ Create a role in aws called gha-cicd using the following cloudformation [templat
 
 ## Finisterra API token secret
 
-You need to crete a Github secret called `GITHUB_TOKEN` with the finisterra api token.
+You need to crete a Github secret called `GITHUB_TOKEN` with the finisterra api token. That can be obtained from https://app.finisterra.io
 
 ## Workflows
 
@@ -20,7 +20,7 @@ This workflow applies Terragrunt configurations. You can find the workflow in th
 
 This workflow generates Terraform code. You can find the workflow in the [generate_tf_code.yaml](generate_tf_code.yaml) file.
 
-Before using the workflow replace the `<AWS_ACCOUNT_ID>`, and `<AWS_REGION>`
+Before using the workflow replace the `<AWS_ACCOUNT_ID>`, and `<AWS_REGION>` with your relevant values
 
 ### Plan Terragrunt
 
