@@ -1,0 +1,443 @@
+name: Generate TF <AWS_ACCOUNT_ID> <AWS_REGION>
+permissions:
+  id-token: write
+  contents: write
+  checks: write
+  security-events: write
+  actions: write
+  pull-requests: write
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/generate_tf_code_<AWS_ACCOUNT_ID>_<AWS_REGION>.yaml
+  workflow_dispatch:
+
+env:
+  FT_BASE_URL: <FT_BASE_URL>
+  AWS_ACCOUNT_ID: <AWS_ACCOUNT_ID>
+  AWS_REGION: <AWS_REGION>
+  ROOT_DIR: "finisterra/generated/aws/<AWS_ACCOUNT_ID>/<AWS_REGION>"
+
+concurrency:
+  group: ${{ github.workflow }}
+
+jobs:
+  setup:
+    if: (github.event_name != 'pull_request') || (github.event_name == 'pull_request' && startsWith(github.head_ref, 'finisterra-initial-setup-<AWS_ACCOUNT_ID>-<AWS_REGION>'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Get services
+        id: get-services
+        run: |
+          result=$(curl -X GET \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.FT_API_KEY }}" \
+            --max-time 300 \
+            "${{ env.FT_BASE_URL }}/api/workspace/workspace?awsAccountId=${{ env.AWS_ACCOUNT_ID }}&awsRegion=${{ env.AWS_REGION }}")
+          services=$(echo "$result" | jq -c '.workspaces')
+          echo "services=$services" >> $GITHUB_OUTPUT
+
+    outputs:
+      services: ${{ steps.get-services.outputs.services }}
+
+  generate_tf_code:
+    needs: [setup]
+    if: needs.setup.outputs.services != '[]'
+    name: ${{ matrix.service.service_name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{fromJson(needs.setup.outputs.services)}}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Extract AWS Information from Folder
+        id: extract-info
+        run: |
+          AWS_ACCOUNT_ID="${{ matrix.service.aws_account_id }}"
+          AWS_REGION="${{ matrix.service.aws_region }}"
+          AWS_MODULE="${{ matrix.service.service_name }}"
+          if [[ "$AWS_REGION" == "global" ]]; then
+            AWS_REGION="us-east-1"
+          fi
+          echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" >> $GITHUB_ENV
+          echo "AWS_REGION=$AWS_REGION" >> $GITHUB_ENV
+          echo "AWS_ROLE=arn:aws:iam::$AWS_ACCOUNT_ID:role/gha-cicd" >> $GITHUB_ENV
+          echo "AWS_MODULE=$AWS_MODULE" >> $GITHUB_ENV
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE }}
+          role-duration-seconds: 3600
+
+      - name: Generate TF files for ${{ matrix.service.service_name }}
+        run: |
+          MAX_RETRIES=5
+          RETRY_DELAY=10  # initial delay in seconds
+          retry_count=0
+
+          while [[ $retry_count -lt $MAX_RETRIES ]]; do
+            docker pull public.ecr.aws/u5n7c4j1/ft-terraformer:latest && break
+            retry_count=$((retry_count + 1))
+            
+            # If we've reached the max number of retries, exit with an error
+            if [[ $retry_count -eq $MAX_RETRIES ]]; then
+              echo "Max retries reached. Exiting."
+              exit 1
+            fi
+
+            echo "Failed to pull image. Retrying in $RETRY_DELAY seconds..."
+            sleep $RETRY_DELAY
+            RETRY_DELAY=$((RETRY_DELAY * 2))  # double the delay for the next iteration
+          done
+
+          docker run -v /tmp/finisterra:/app/finisterra -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN -e AWS_REGION=$AWS_REGION -e FT_API_TOKEN=${{ secrets.GITHUB_TOKEN }} public.ecr.aws/u5n7c4j1/ft-terraformer:latest main.py -m ${{ env.AWS_MODULE }}
+
+      - name: Set Git User who triggered the workflow
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Create PR for ${{ matrix.service.service_name }}
+        id: create_pr
+        run: |
+          FOLDERS=$(find /tmp/finisterra/ -maxdepth 1 -mindepth 1 -type d -not -name ".*")
+          SERVICE_FOLDER="/tmp/finisterra/${{ matrix.service.service_name }}"
+          STACK_LIST=""
+          if [[ -z "$FOLDERS" ]]; then
+              echo "No resources found for ${AWS_MODULE}"
+              echo "stack_list=\"$STACK_LIST\"" >> $GITHUB_OUTPUT
+              exit 0
+          fi
+
+          # Check if SERVICE_FOLDER is not in FOLDERS and add if it's missing
+          if ! echo "$FOLDERS" | grep -w -q "^${SERVICE_FOLDER}$"; then
+              FOLDERS="$FOLDERS $SERVICE_FOLDER"
+          fi
+
+          for DIR in $FOLDERS; do
+              git checkout ${{ github.base_ref }}
+              FOLDER_NAME=$(basename "$DIR")
+
+              if [[ "$FOLDER_NAME" != "${AWS_MODULE}" ]]; then
+                BRANCH="${AWS_MODULE}.${FOLDER_NAME}.aws.${{ env.AWS_ACCOUNT_ID }}.${{ env.AWS_REGION }}"
+              else
+                BRANCH="${FOLDER_NAME}.aws.${{ env.AWS_ACCOUNT_ID }}.${{ env.AWS_REGION }}"
+              fi
+
+              # Fetch remote branches
+              git fetch origin > /dev/null 2>&1
+
+              # Check if the branch exists remotely
+              EXISTS=$(git ls-remote --heads origin "refs/heads/${BRANCH}" | wc -l)
+
+              if [ "$EXISTS" -eq "1" ]; then
+                # Get PRs associated with the branch
+                PR_STATE=$(curl -s \
+                  -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  --max-time 300 \
+                  "https://api.github.com/repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:${BRANCH}" \
+                  | jq -r '.[0].state')
+
+                if [ "$PR_STATE" == "open" ]; then
+                  git checkout ${BRANCH}
+                  git pull origin ${BRANCH}
+                else
+                  git push origin --delete ${BRANCH}
+                  git checkout -b ${BRANCH}
+                fi
+              else
+                git checkout -b ${BRANCH}
+              fi
+
+              mkdir -p ${{ env.ROOT_DIR }}
+              cp /tmp/finisterra/terragrunt.hcl ${{ env.ROOT_DIR }}
+              TARGET_DIR="${{ env.ROOT_DIR }}/$(basename ${DIR})"
+              find "${TARGET_DIR}" -mindepth 1 -not -name 'terragrunt.hcl' -exec rm -rf {} + || true
+              cp -a ${DIR} ${{ env.ROOT_DIR }} || true
+              find "${TARGET_DIR}" -name ".*" -exec rm -rf {} \; || true
+
+              if [ -n "$(git status --porcelain)" ]; then
+                # Changes detected
+                git add --all
+                git commit -m "Automatic scan for ${BRANCH}"
+                git push origin ${BRANCH}
+
+                if [[ "$FOLDER_NAME" != "${AWS_MODULE}" ]]; then
+                  echo "Skipping PR for ${FOLDER_NAME}"
+                  STACK_LIST="${STACK_LIST} ${BRANCH}"
+                  continue
+                fi
+
+                # Create a PR
+                PR_BODY="Automated Code Generated\n\nFOLDER: ${FOLDER_NAME}\n\nAWS_ACCOUNT_ID: ${{ env.AWS_ACCOUNT_ID }}\n\nAWS_REGION: ${{ env.AWS_REGION }}\n\n[skip cicd]"
+                curl -X POST \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer ${{ secrets.FT_API_KEY }}" \
+                  -d '{"repositoryName": "${{ github.repository }}", "branchName": "'"${BRANCH}"'", "owner": "${{ github.repository_owner }}", "pr_body": "'"${PR_BODY}"'"}' \
+                  --max-time 300 \
+                  ${{ env.FT_BASE_URL }}/api/github/pr
+              else
+                echo "No changes detected in ${FOLDER_NAME}. Skipping commit and push."
+              fi
+          done
+
+          echo "stack_list=\"$STACK_LIST\"" >> $GITHUB_OUTPUT
+          echo "stack_list=\"$STACK_LIST\""
+
+      - uses: cloudposse/github-action-matrix-outputs-write@0.4.2
+        id: stack_output
+        if: steps.create_pr.outputs.stack_list != '""'
+        with:
+          matrix-step-name: ${{ github.job }}
+          matrix-key: ${{ matrix.service.service_name }}
+          outputs: |-
+            stack_list: ${{ steps.create_pr.outputs.stack_list }}
+
+  # compile_stacks:
+  #   name: Get Stacks
+  #   runs-on: ubuntu-latest
+  #   needs: [generate_tf_code]
+  #   if: always()
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v3
+  #       with:
+  #         fetch-depth: 0
+
+  #     - uses: cloudposse/github-action-matrix-outputs-read@0.1.1
+  #       id: read
+  #       with:
+  #         matrix-step-name: generate_tf_code
+
+  #     - name: Export stacks
+  #       id: export
+  #       if: steps.read.outputs.result != '{}'
+  #       run: |
+  #         # Original JSON string output
+  #         INPUT_JSON='${{ steps.read.outputs.result }}'
+
+  #         # Using jq to transform the input JSON into the desired array format
+  #         STACKS_LIST=$(echo $INPUT_JSON | jq -r -c '
+  #           .stack_list |
+  #           to_entries |
+  #           map(
+  #             select(.value != null and .value != "") |
+  #             .value | split(" ") |
+  #             map(
+  #               split(".") |
+  #               select(length > 1) |
+  #               {stack_name: .[1], branch: join(".")}
+  #             )
+  #           ) |
+  #           flatten |
+  #           group_by(.stack_name) |
+  #           map(
+  #             {
+  #               stack_name: .[0].stack_name,
+  #               branches: map(.branch)
+  #             }
+  #           )
+  #         ')
+
+  #         ALL_STACKS=$(find ${{ env.ROOT_DIR }} -maxdepth 1 -mindepth 1 -type d -name "stack_*" -exec basename {} \;)
+
+  #         # Extract stack names from STACKS_LIST
+  #         STACK_NAMES=$(echo $STACKS_LIST | jq -r '.[].stack_name')
+
+  #         # Initialize an array to hold missing stacks
+  #         missing_stacks=()
+
+  #         # Find folders in STACKS not in STACKS_LIST and add them to the array
+  #         for folder in $ALL_STACKS; do
+  #           if ! echo "$STACK_NAMES" | grep -q "^$folder$"; then
+  #             missing_stacks+=("$folder")
+  #           fi
+  #         done
+
+  #         # Convert the missing stacks array to a JSON array of strings
+  #         MISSING_STACKS_JSON=$(printf '%s\n' "${missing_stacks[@]}" | jq -R -s -c 'split("\n")[:-1]')
+
+  #         # Output the missing stacks to GitHub output
+  #         echo "Exporting missing stacks $MISSING_STACKS_JSON"
+  #         echo "missing_stacks=$MISSING_STACKS_JSON" >> $GITHUB_OUTPUT
+
+  #         # Output existing stacks
+  #         echo "Exporting existing stacks $STACKS_LIST"
+  #         echo "stacks=$STACKS_LIST" >> $GITHUB_OUTPUT
+
+  #   outputs:
+  #     stacks: ${{ steps.export.outputs.stacks || '[]' }}
+  #     missing_stacks: ${{ steps.export.outputs.missing_stacks || '[""]'}}
+
+  # generate_tf_code_stacks:
+  #   needs: [compile_stacks]
+  #   if: needs.compile_stacks.outputs.stacks != '[]'
+  #   name: Creating ${{ matrix.stack.stack_name }}
+  #   runs-on: ubuntu-latest
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       stack: ${{fromJson(needs.compile_stacks.outputs.stacks)}}
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v3
+  #       with:
+  #         fetch-depth: 0
+
+  #     - name: Set Git User who triggered the workflow
+  #       run: |
+  #         git config user.name "${{ github.actor }}"
+  #         git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+  #     - name: Merge stack branches
+  #       run: |
+  #         git checkout main
+  #         FIRST=true  # Flag to identify the first iteration
+
+  #         # Looping over the branches
+  #         for BRANCH in ${{ join(matrix.stack.branches, ' ') }}; do
+  #           if [ "$FIRST" = true ]; then
+  #               # Split the branch name by '.' and extract the relevant parts
+  #               IFS='.' read -r -a PARTS <<< "$BRANCH"
+  #               NEW_BRANCH_NAME="${{ matrix.stack.stack_name }}.${PARTS[2]}.${PARTS[3]}.${PARTS[4]}"
+  #               STACK_FOLDER="finisterra/generated/${PARTS[2]}/${PARTS[3]}/${PARTS[4]}/${{ matrix.stack.stack_name }}"
+
+  #               # Fetch remote branches
+  #               git fetch origin > /dev/null 2>&1
+
+  #               # Check if the branch exists remotely
+  #               EXISTS=$(git ls-remote --heads origin "refs/heads/${NEW_BRANCH_NAME}" | wc -l)
+
+  #               if [ "$EXISTS" -eq "1" ]; then
+  #                   # Get PRs associated with the branch
+  #                   PR_STATE=$(curl -s \
+  #                     -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+  #                     -H "Accept: application/vnd.github.v3+json" \
+  #                     --max-time 300 \
+  #                     "https://api.github.com/repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:${NEW_BRANCH_NAME}" \
+  #                     | jq -r '.[0].state')
+
+  #                   if [ "$PR_STATE" == "open" ]; then
+  #                     git checkout ${NEW_BRANCH_NAME}
+  #                     git pull origin ${NEW_BRANCH_NAME}
+  #                   else
+  #                     echo "DELETING BRANCH ${NEW_BRANCH_NAME}"
+  #                     git push origin --delete ${NEW_BRANCH_NAME}
+  #                     git checkout -b ${NEW_BRANCH_NAME}
+  #                   fi
+  #               else
+  #                   git checkout -b ${NEW_BRANCH_NAME}
+  #               fi
+
+  #               #Clena existing code
+  #               rm -rf ${STACK_FOLDER} || true
+
+  #               if [ -n "$(git status --porcelain)" ]; then
+  #                 echo "Changes detected"
+  #                 git add --all
+  #                 git commit -m "Automatic scan for ${NEW_BRANCH_NAME}"
+  #                 git push origin ${NEW_BRANCH_NAME}
+  #               fi
+
+  #               # Reset the FIRST flag so that the next iterations skip this block
+  #               FIRST=false
+  #           fi
+
+  #           echo "Merging branch $BRANCH into $NEW_BRANCH_NAME"
+  #           git fetch origin $BRANCH
+  #           git merge --no-ff --allow-unrelated-histories origin/$BRANCH -m "Merging branch $BRANCH into $NEW_BRANCH_NAME"
+  #         done
+
+  #         git push origin ${NEW_BRANCH_NAME}
+
+  #         # Create a PR
+  #         PR_BODY="Automated code generated\n\nFOLDER:  ${{ matrix.stack.stack_name }}\n\n[skip cicd]"
+  #         curl -X POST \
+  #           -H "Content-Type: application/json" \
+  #           -H "Authorization: Bearer ${{ secrets.FT_API_KEY }}" \
+  #           -d '{"repositoryName": "${{ github.repository }}", "branchName": "'"${NEW_BRANCH_NAME}"'", "owner": "${{ github.repository_owner }}", "pr_body": "'"${PR_BODY}"'"}' \
+  #           --max-time 300 \
+  #           ${{ env.FT_BASE_URL }}/api/github/pr
+
+  # delete_tf_code_stacks:
+  #   needs: [compile_stacks, generate_tf_code_stacks]
+  #   if: needs.compile_stacks.outputs.missing_stacks != '[""]'
+  #   name: Deleting ${{ matrix.stack }}
+  #   runs-on: ubuntu-latest
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       stack: ${{fromJson(needs.compile_stacks.outputs.missing_stacks)}}
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v3
+  #       with:
+  #         fetch-depth: 0
+
+  #     - name: Set Git User who triggered the workflow
+  #       run: |
+  #         git config user.name "${{ github.actor }}"
+  #         git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+  #     - name: Delete stack
+  #       run: |
+  #         git checkout main
+  #         BRANCH="${{ matrix.stack }}.aws.${{ env.AWS_ACCOUNT_ID }}.${{ env.AWS_REGION }}"
+
+  #         # Fetch remote branches
+  #         git fetch origin > /dev/null 2>&1
+
+  #         # Check if the branch exists remotely
+  #         EXISTS=$(git ls-remote --heads origin "refs/heads/${BRANCH}" | wc -l)
+
+  #         if [ "$EXISTS" -eq "1" ]; then
+  #           # Get PRs associated with the branch
+  #           PR_STATE=$(curl -s \
+  #             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+  #             -H "Accept: application/vnd.github.v3+json" \
+  #             --max-time 300 \
+  #             "https://api.github.com/repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:${BRANCH}" \
+  #             | jq -r '.[0].state')
+
+  #           if [ "$PR_STATE" == "open" ]; then
+  #             git checkout ${BRANCH}
+  #             git pull origin ${BRANCH}
+  #           else
+  #             git push origin --delete ${BRANCH}
+  #             git checkout -b ${BRANCH}
+  #           fi
+  #         else
+  #           git checkout -b ${BRANCH}
+  #         fi
+
+  #         find "${{ env.ROOT_DIR }}/${{ matrix.stack }}" -mindepth 1 -not -name 'terragrunt.hcl' -exec rm -rf {} + || true
+
+  #         if [ -n "$(git status --porcelain)" ]; then
+  #           echo "Changes detected"
+  #           git add --all
+  #           git commit -m "Automatic scan for ${BRANCH}"
+  #           git push origin ${BRANCH}
+  #         fi
+
+  #         # Create a PR
+  #         PR_BODY="Automated code generated\n\nFOLDER:  ${{ matrix.stack }}\n\n[skip cicd]"
+  #         curl -X POST \
+  #           -H "Content-Type: application/json" \
+  #           -H "Authorization: Bearer ${{ secrets.FT_API_KEY }}" \
+  #           -d '{"repositoryName": "${{ github.repository }}", "branchName": "'"${BRANCH}"'", "owner": "${{ github.repository_owner }}", "pr_body": "'"${PR_BODY}"'"}' \
+  #           --max-time 300 \
+  #           ${{ env.FT_BASE_URL }}/api/github/pr
