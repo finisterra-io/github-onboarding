@@ -8,9 +8,6 @@ This repository contains several workflows for managing Terraform infrastructure
 
 This workflow applies Terragrunt configurations. You can find the workflow in the [apply_terragrunt.yaml](apply_terragrunt.yaml) file.
 
-'''yaml
-aws
-'''
 
 ### Generate Terraform Code
 
